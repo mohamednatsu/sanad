@@ -1,199 +1,503 @@
-import { useState, useEffect } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { useEffect, useRef, useState } from "react";
+import { useAuth } from "@/hooks/useAuth";
 import { useLanguage } from "@/hooks/useLanguage";
-import { useToast } from "@/hooks/use-toast";
-import { VideoIcon, VideoOffIcon, PhoneCallIcon } from "lucide-react";
-import { PatientAppointment } from "@/services/appointments";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/use-toast";
+import { Video, VideoOff, Mic, MicOff, Phone } from "lucide-react";
+import { supabase } from "@/integrations/supabase/client";
+import { format } from "date-fns";
 
-interface SessionTabProps {
-  appointments: PatientAppointment[];
-  formatAppointmentDate: (dateString: string) => string;
-  formatAppointmentTime: (dateString: string) => string;
+interface TherapistVideoSessionProps {
   isVisible: boolean;
 }
 
-export const SessionTab = ({ 
-  appointments,
-  formatAppointmentDate,
-  formatAppointmentTime,
-  isVisible
-}: SessionTabProps) => {
+interface AppointmentSession {
+  id: string;
+  doctor_id: string;
+  patient_id: string;
+  patient_name: string;
+  session_date: string;
+  session_type: string;
+  status: string;
+}
+
+const TherapistVideoSession = ({ isVisible }: TherapistVideoSessionProps) => {
+  const { user } = useAuth();
   const { t } = useLanguage();
   const { toast } = useToast();
-  const [videoEnabled, setVideoEnabled] = useState(true);
-  const [inSession, setInSession] = useState(false);
-  const { language } = useLanguage();
-  const isRTL = language === 'ar';
-  // Find the next upcoming appointment - using 'scheduled' instead of 'upcoming'
-  const upcomingAppointment = appointments.find(apt => apt.status === 'scheduled');
-  
-  // Handle join session
-  const handleJoinSession = () => {
-    if (!upcomingAppointment) {
-      toast({
-        title: t('no_scheduled_session'),
-        description: t('please_schedule_session_first'),
-        variant: "destructive"
-      });
-      return;
+
+  // Video call state
+  const [isSessionActive, setIsSessionActive] = useState(false);
+  const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+  const [isAudioEnabled, setIsAudioEnabled] = useState(true);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [upcomingSession, setUpcomingSession] = useState<AppointmentSession | null>(null);
+  const [isTestMode, setIsTestMode] = useState(false);
+  const [hasCameraPermission, setHasCameraPermission] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+
+  // Refs for video elements
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+
+  // WebRTC states
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+
+  // Check camera permissions
+  const checkCameraPermissions = async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+      const hasPermission = videoDevices.some(device => device.label !== '');
+      setHasCameraPermission(hasPermission);
+      return hasPermission;
+    } catch (error) {
+      console.error("Error checking camera permissions:", error);
+      setHasCameraPermission(false);
+      return false;
     }
-    
-    setInSession(true);
-    toast({
-      title: t('session_joined'),
-      description: t('waiting_for_therapist')
-    });
   };
-  
-  // Handle end session
-  const handleEndSession = () => {
-    setInSession(false);
-    toast({
-      title: t('session_ended'),
-      description: t('session_summary_email')
-    });
+
+  // Fetch upcoming session
+  useEffect(() => {
+    const fetchUpcomingSession = async () => {
+      if (!user) return;
+
+      try {
+        const now = new Date();
+        const { data, error } = await supabase
+          .from('appointments')
+          .select('*')
+          .eq('doctor_id', user.id)
+          .eq('status', 'scheduled')
+          .gte('session_date', now.toISOString())
+          .order('session_date', { ascending: true })
+          .limit(1)
+          .single();
+
+        if (error && error.code !== 'PGRST116') {
+          console.error("Error fetching upcoming session:", error);
+        }
+
+        if (data) {
+          console.log(data);
+          setUpcomingSession({
+            ...data,
+            patient_name: "Unknown Patient"
+          } as AppointmentSession);
+        }
+      } catch (error) {
+        console.error("Error fetching upcoming session:", error);
+      }
+    };
+
+    fetchUpcomingSession();
+    checkCameraPermissions();
+  }, [user]);
+
+  // Initialize WebRTC
+  const initializeWebRTC = async (testMode = false) => {
+    try {
+      setIsConnecting(true);
+      setIsTestMode(testMode);
+      setCameraError(null);
+      setIsSessionActive(true);  // Render video elements immediately
+
+      // First check if we have permission
+      const hasPermission = await checkCameraPermissions();
+      if (!hasPermission) {
+        throw new Error("Camera permission denied");
+      }
+
+      // Get media stream with better error handling
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: isVideoEnabled ? {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "user"
+        } : false,
+        audio: isAudioEnabled
+      }).catch(err => {
+        console.error("Error accessing media devices:", err);
+        throw err;
+      });
+
+      localStreamRef.current = stream;
+
+      // Attach to local video after component re-render
+      setTimeout(() => {
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+          localVideoRef.current.play()
+            .catch(e => console.error("Error playing local video:", e));
+        }
+      }, 100);
+
+      // In test mode, display same stream in both videos
+      if (testMode) {
+        setTimeout(() => {
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = stream;
+            remoteVideoRef.current.play()
+              .catch(e => console.error("Error playing remote test video:", e));
+          }
+        }, 100);
+        setIsConnecting(false);
+        toast({
+          title: t('test_session_started'),
+          description: t('you_can_test_your_video_and_audio'),
+        });
+        return;
+      }
+
+      // Create peer connection for real sessions
+      const configuration = {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' }
+        ]
+      };
+
+      peerConnectionRef.current = new RTCPeerConnection(configuration);
+
+      // Add tracks to peer connection
+      stream.getTracks().forEach(track => {
+        if (peerConnectionRef.current) {
+          peerConnectionRef.current.addTrack(track, stream);
+        }
+      });
+
+      // Handle remote tracks
+      peerConnectionRef.current.ontrack = (event) => {
+        if (remoteVideoRef.current && event.streams && event.streams[0]) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+          remoteVideoRef.current.onloadedmetadata = () => {
+            remoteVideoRef.current?.play().catch(e => console.error("Error playing remote video:", e));
+          };
+        }
+      };
+
+      setIsConnecting(false);
+
+      toast({
+        title: t('session_joined'),
+        description: upcomingSession ?
+          `${t('session_with')} ${upcomingSession.patient_name}` :
+          t('session_active'),
+      });
+    } catch (error) {
+      console.error("Error initializing WebRTC:", error);
+      setIsConnecting(false);
+      setIsSessionActive(false); // Hide video elements on error
+
+      let errorMessage = t('please_check_camera_microphone_permissions');
+      if (error instanceof Error) {
+        if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+          errorMessage = t('no_camera_or_microphone_found');
+        } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+          errorMessage = t('camera_or_microphone_in_use');
+        } else if (error.name === 'OverconstrainedError' || error.name === 'ConstraintNotSatisfiedError') {
+          errorMessage = t('requested_settings_not_supported');
+        } else if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+          errorMessage = t('permission_denied_please_enable_camera_microphone');
+          setCameraError(errorMessage);
+        }
+      }
+
+      toast({
+        title: t('error_starting_session'),
+        description: errorMessage,
+        variant: "destructive",
+      });
+    }
   };
-  
+
   // Toggle video
   const toggleVideo = () => {
-    setVideoEnabled(!videoEnabled);
+    if (localStreamRef.current) {
+      const videoTracks = localStreamRef.current.getVideoTracks();
+
+      // If enabling video but no active tracks, request new stream
+      if (!isVideoEnabled && videoTracks.length === 0) {
+        navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+          audio: isAudioEnabled
+        }).then(stream => {
+          localStreamRef.current = stream;
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
+          }
+          setIsVideoEnabled(true);
+        }).catch(console.error);
+        return;
+      }
+
+      // Toggle existing tracks
+      videoTracks.forEach(track => {
+        track.enabled = !isVideoEnabled;
+      });
+      setIsVideoEnabled(!isVideoEnabled);
+
+      toast({
+        title: !isVideoEnabled ? t('video_enabled') : t('video_disabled'),
+        description: !isVideoEnabled ? '' : t('audio_only_mode'),
+      });
+    }
+  };
+
+  // Toggle audio
+  const toggleAudio = () => {
+    if (localStreamRef.current) {
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      audioTracks.forEach(track => {
+        track.enabled = !isAudioEnabled;
+      });
+      setIsAudioEnabled(!isAudioEnabled);
+    }
+  };
+
+  // End session
+  const endSession = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    // Clear video elements
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
+    }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+
+    setIsSessionActive(false);
+    setIsTestMode(false);
+    setIsVideoEnabled(true);
+    setIsAudioEnabled(true);
+
     toast({
-      title: videoEnabled ? t('video_disabled') : t('video_enabled'),
+      title: isTestMode ? t('test_session_ended') : t('session_ended'),
+      description: isTestMode ? '' : t('session_summary_email'),
     });
   };
 
+  // Handle visibility changes
+  useEffect(() => {
+    if (!isVisible && isSessionActive) {
+      // When component becomes invisible, pause all tracks
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => track.enabled = false);
+      }
+    } else if (isVisible && isSessionActive) {
+      // When component becomes visible again, resume tracks
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => {
+          if (track.kind === 'video') {
+            track.enabled = isVideoEnabled;
+          } else if (track.kind === 'audio') {
+            track.enabled = isAudioEnabled;
+          }
+        });
+      }
+    }
+  }, [isVisible]);
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      endSession(); // Clean up everything when component unmounts
+    };
+  }, []);
+
   return (
-    <div className="space-y-8">
-      {inSession ? (
-        <Card className="border border-border/50" dir={isRTL ? "rtl" : "ltr"}>
-          <CardHeader>
-            <CardTitle className="flex items-center justify-between">
-              <div>{t('live_session')}</div>
-              <div className="flex gap-2">
-                <Button 
-                  variant="outline" 
-                  size="sm" 
-                  onClick={toggleVideo}
-                >
-                  {videoEnabled ? 
-                    <VideoIcon className="h-4 w-4 mr-2" /> : 
-                    <VideoOffIcon className="h-4 w-4 mr-2" />
-                  }
-                  {videoEnabled ? t('disable_video') : t('enable_video')}
-                </Button>
-                <Button 
-                  variant="destructive" 
-                  size="sm" 
-                  onClick={handleEndSession}
-                >
-                  {t('end_session')}
-                </Button>
+    <Card>
+      <CardHeader>
+        <CardTitle>{t('video_session')}</CardTitle>
+        <CardDescription>{t('manage_your_therapy_sessions')}</CardDescription>
+      </CardHeader>
+
+      <CardContent className="space-y-6">
+        {cameraError && (
+          <div className="p-4 bg-red-100 text-red-800 rounded-lg mb-4">
+            <p>{cameraError}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={() => {
+                window.location.reload(); // Sometimes needed to trigger permission dialog
+              }}
+            >
+              {t('retry')}
+            </Button>
+          </div>
+        )}
+
+        {!hasCameraPermission && !cameraError && (
+          <div className="p-4 bg-yellow-100 text-yellow-800 rounded-lg mb-4">
+            <p>{t('camera_permission_required')}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={checkCameraPermissions}
+            >
+              {t('check_permissions')}
+            </Button>
+          </div>
+        )}
+
+        {isSessionActive ? (
+          <div className="space-y-4">
+            <div className="relative">
+              <div className="w-full aspect-video bg-black rounded-lg overflow-hidden">
+                {/* Remote video (patient or test video) */}
+                <video
+                  ref={remoteVideoRef}
+                  className="w-full h-full object-cover"
+                  autoPlay
+                  playsInline
+                ></video>
+
+                {/* Connecting overlay */}
+                {isConnecting && (
+                  <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center rounded-lg">
+                    <div className="flex flex-col items-center">
+                      <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-primary mb-4"></div>
+                      <p className="text-white">{t('connecting')}</p>
+                    </div>
+                  </div>
+                )}
               </div>
-            </CardTitle>
-          </CardHeader>
-          <CardContent >
-            <div className="aspect-video bg-muted rounded-lg overflow-hidden flex items-center justify-center">
-              {videoEnabled ? (
-                <div className="text-center p-8">
-                  <div className="w-32 h-32 bg-primary/10 rounded-full mx-auto flex items-center justify-center mb-4">
-                    <VideoIcon className="h-12 w-12 text-primary" />
-                  </div>
-                  <h3 className="text-xl font-medium mb-2">{t('connecting')}</h3>
-                  <p className="text-muted-foreground">{t('waiting_for_therapist')}</p>
-                </div>
-              ) : (
-                <div className="text-center p-8">
-                  <div className="w-32 h-32 bg-primary/10 rounded-full mx-auto flex items-center justify-center mb-4">
-                    <VideoOffIcon className="h-12 w-12 text-primary" />
-                  </div>
-                  <h3 className="text-xl font-medium mb-2">{t('video_disabled')}</h3>
-                  <p className="text-muted-foreground">{t('audio_only_mode')}</p>
-                </div>
-              )}
+
+              {/* Local video (therapist) */}
+              <div className="absolute bottom-4 right-4 w-1/4 aspect-video bg-gray-800 rounded-lg overflow-hidden shadow-lg border-2 border-white">
+                <video
+                  ref={localVideoRef}
+                  className="w-full h-full object-cover"
+                  autoPlay
+                  playsInline
+                  muted
+                ></video>
+              </div>
             </div>
-            
-            <div className="mt-6 flex items-center justify-center">
-              <Button 
-                size="lg" 
-                variant="destructive"
-                className="rounded-full px-8"
-                onClick={handleEndSession}
+
+            <div className="flex justify-center gap-4">
+              <Button
+                variant={isVideoEnabled ? "default" : "outline"}
+                onClick={toggleVideo}
+                className="rounded-full p-3 h-12 w-12"
               >
-                <PhoneCallIcon className="h-5 w-5 mr-2" />
-                {t('end_call')}
+                {isVideoEnabled ? <Video size={18} /> : <VideoOff size={18} />}
+              </Button>
+
+              <Button
+                variant={isAudioEnabled ? "default" : "outline"}
+                onClick={toggleAudio}
+                className="rounded-full p-3 h-12 w-12"
+              >
+                {isAudioEnabled ? <Mic size={18} /> : <MicOff size={18} />}
+              </Button>
+
+              <Button
+                variant="destructive"
+                onClick={endSession}
+                className="rounded-full p-3 h-12 w-12"
+              >
+                <Phone size={18} className="rotate-135" />
               </Button>
             </div>
-          </CardContent>
-        </Card>
-      ) : (
-        <Card className="border border-border/50" dir={isRTL ? "rtl" : "ltr"}>
-          <CardHeader>
-            <CardTitle>{t('video_session')}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {upcomingAppointment ? (
-              <div className="text-center py-8">
-                <div className="w-24 h-24 bg-primary/10 rounded-full mx-auto flex items-center justify-center mb-4">
-                  <VideoIcon className="h-8 w-8 text-primary" />
-                </div>
-                <h3 className="text-xl font-medium mb-2">
-                  {t('upcoming_session')}
-                </h3>
-                <p className="text-muted-foreground mb-6">
-                  {formatAppointmentDate(upcomingAppointment.session_date)} {t('at')} {formatAppointmentTime(upcomingAppointment.session_date)}
-                </p>
-                <Button onClick={handleJoinSession} className="px-8">
-                  {t('join_session')}
-                </Button>
-              </div>
-            ) : (
-              <div className="text-center py-8">
-                <div className="w-24 h-24 bg-muted rounded-full mx-auto flex items-center justify-center mb-4">
-                  <VideoOffIcon className="h-8 w-8 text-muted-foreground" />
-                </div>
-                <h3 className="text-xl font-medium mb-2">
-                  {t('no_scheduled_sessions')}
-                </h3>
-                <p className="text-muted-foreground mb-6">
-                  {t('schedule_session_to_start')}
-                </p>
-                <Button variant="outline">
-                  {t('schedule_session')}
-                </Button>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
 
-      <Card className="border border-border/50" dir={isRTL ? "rtl" : "ltr"}>
-        <CardHeader>
-          <CardTitle>{t('session_tips')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            <div className="bg-accent rounded-lg p-4">
-              <h3 className="font-medium mb-1">{t('quiet_environment')}</h3>
-              <p className="text-sm text-muted-foreground">
-                {t('find_quiet_space_tip')}
-              </p>
-            </div>
-            <div className="bg-accent rounded-lg p-4">
-              <h3 className="font-medium mb-1">{t('test_equipment')}</h3>
-              <p className="text-sm text-muted-foreground">
-                {t('test_equipment_tip')}
-              </p>
-            </div>
-            <div className="bg-accent rounded-lg p-4">
-              <h3 className="font-medium mb-1">{t('be_prepared')}</h3>
-              <p className="text-sm text-muted-foreground">
-                {t('be_prepared_tip')}
-              </p>
+            <div className="text-center text-sm text-muted-foreground">
+              {isTestMode ? (
+                <p>{t('test_session_active')}</p>
+              ) : upcomingSession ? (
+                <p>{t('session_with')} <strong>{upcomingSession.patient_name}</strong></p>
+              ) : (
+                <p>{t('live_session')}</p>
+              )}
             </div>
           </div>
-        </CardContent>
-      </Card>
-    </div>
+        ) : isConnecting ? (
+          <div className="flex flex-col items-center justify-center py-12">
+            <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-primary mb-4"></div>
+            <p>{t('connecting')}</p>
+            {!hasCameraPermission && (
+              <p className="text-sm text-muted-foreground mt-2">
+                {t('checking_camera_permissions')}
+              </p>
+            )}
+          </div>
+        ) : upcomingSession ? (
+          <div className="space-y-6 py-6">
+            <div className="text-center space-y-2">
+              <h3 className="text-xl font-medium">{t('upcoming_session')}</h3>
+              <p className="text-primary text-2xl font-semibold">
+                {upcomingSession.patient_name}
+              </p>
+              <p>
+                {format(new Date(upcomingSession.session_date), 'PPP')} {t('at')} {format(new Date(upcomingSession.session_date), 'p')}
+              </p>
+              <p className="text-sm text-muted-foreground">
+                {upcomingSession.session_type}
+              </p>
+            </div>
+
+            <div className="flex justify-center gap-4">
+              <Button
+                onClick={() => initializeWebRTC(false)}
+                disabled={!hasCameraPermission}
+              >
+                {t('join_session')}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => initializeWebRTC(true)}
+                disabled={!hasCameraPermission}
+              >
+                {t('test_video_audio')}
+              </Button>
+            </div>
+
+            <div className="border rounded-lg p-4 space-y-4 bg-muted/30">
+              <h4 className="font-medium">{t('session_tips')}</h4>
+              <div className="space-y-2">
+                <p className="text-sm font-medium">{t('quiet_environment')}</p>
+                <p className="text-xs text-muted-foreground">{t('find_quiet_space_tip')}</p>
+              </div>
+              <div className="space-y-2">
+                <p className="text-sm font-medium">{t('test_equipment')}</p>
+                <p className="text-xs text-muted-foreground">{t('test_equipment_tip')}</p>
+              </div>
+              <div className="space-y-2">
+                <p className="text-sm font-medium">{t('be_prepared')}</p>
+                <p className="text-xs text-muted-foreground">{t('be_prepared_tip')}</p>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="text-center py-12 space-y-4">
+            <h3 className="text-xl font-medium mb-2">{t('no_scheduled_session')}</h3>
+            <p className="text-muted-foreground mb-6">{t('please_schedule_session_first')}</p>
+            <Button
+              variant="outline"
+              onClick={() => initializeWebRTC(true)}
+              disabled={!hasCameraPermission}
+            >
+              {t('test_video_audio')}
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 };
+
+export default TherapistVideoSession;
